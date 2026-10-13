@@ -74,8 +74,10 @@ struct restriction {
   template <typename Ctx>
   friend void deserialize(Ctx const&, restriction*) {}
 
-  way_pos_t from_ : 4;
-  way_pos_t to_ : 4;
+  static_assert(kMaxWaysPerNode <= 255U, "from_ / to_ hold a way position");
+
+  way_pos_t from_ : 8;
+  way_pos_t to_ : 8;
   way_pos_t applies_to_default_ : 1;
   way_pos_t applies_to_bus_ : 1;
   way_pos_t applies_to_hgv_ : 1;

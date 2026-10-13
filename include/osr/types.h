@@ -175,7 +175,8 @@ using elevation_monotonic_t =
 
 using way_pos_t = std::uint8_t;
 
-constexpr auto const kMaxWaysPerNode = way_pos_t{32U};
+// Positions 0 to 254: the limit itself still fits way_pos_t.
+constexpr auto const kMaxWaysPerNode = way_pos_t{255U};
 constexpr auto const kInlineWaysPerNode = way_pos_t{2U};
 
 using cost_t = std::uint32_t;

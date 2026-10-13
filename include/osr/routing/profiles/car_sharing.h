@@ -220,10 +220,12 @@ struct car_sharing {
     node_idx_t pred_{node_idx_t::invalid()};
     cost_t cost_{kInfeasible};
     level_t pred_lvl_{kNoLevel};
-    std::uint8_t pred_way_ : 5 {0U};
+    static_assert(kMaxWaysPerNode <= 255U, "pred_way_ holds a way position");
+
+    std::uint8_t pred_way_ : 8 {0U};
     std::uint8_t pred_dir_ : 1 {0U};
-    std::uint8_t pred_type_
-        : 2 {static_cast<std::uint8_t>(node_type::kInvalid)};
+    std::uint8_t pred_type_ : 2 {
+        static_cast<std::uint8_t>(node_type::kInvalid)};
     duration_t duration_{kMaxDuration};
     OSR_NO_UNIQUE_ADDRESS Tracking tracking_{};
 

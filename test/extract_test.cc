@@ -1,5 +1,6 @@
 #include "gtest/gtest.h"
 
+#include <cmath>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -7,6 +8,8 @@
 #include <string_view>
 
 #include "cista/mmap.h"
+
+#include "fmt/core.h"
 
 #include "osr/extract/extract.h"
 
@@ -245,7 +248,7 @@ TEST(extract, bus_only_on_highway) {
   ASSERT_TRUE(wp.is_foot_accessible());
 }
 
-TEST(extract, ignores_ways_exceeding_max_ways_per_node) {
+TEST(extract, node_with_many_ways) {
   auto const p = fs::temp_directory_path() / "osr_24_way_node_test";
   auto ec = std::error_code{};
   fs::remove_all(p, ec);
@@ -254,10 +257,11 @@ TEST(extract, ignores_ways_exceeding_max_ways_per_node) {
   extract(false, "test/39-way-node.osm.pbf", p, {});
 
   auto w = ways{p, cista::mmap::protection::READ};
+  auto max_ways = std::size_t{0U};
   for (auto n = node_idx_t{0U}; n != w.n_nodes(); ++n) {
     auto const ways = w.r_->node_ways_[n];
     auto const in_way_idx = w.r_->node_in_way_idx_[n];
-    EXPECT_LE(ways.size(), kMaxWaysPerNode);
+    max_ways = std::max(max_ways, ways.size());
     ASSERT_EQ(ways.size(), in_way_idx.size());
     for (auto i = std::size_t{0U}; i != ways.size(); ++i) {
       auto const way = ways[i];
@@ -268,6 +272,35 @@ TEST(extract, ignores_ways_exceeding_max_ways_per_node) {
           << "node_ways_/node_in_way_idx_ does not point back to this node";
     }
   }
+  EXPECT_EQ(39U, max_ways);  // all of them
+}
+
+TEST(extract, throws_on_node_exceeding_max_ways) {
+  auto const p = fs::temp_directory_path() / "osr_too_many_ways_test";
+
+  // kMaxWaysPerNode + 1 ways from node 1.
+  auto xml = std::string{R"(<osm version="0.6" generator="test">
+  <node id="1" lat="48.0" lon="9.0"/>
+)"};
+  auto const n = kMaxWaysPerNode + 1U;
+  for (auto i = 0U; i != n; ++i) {
+    xml += fmt::format(R"(  <node id="{}" lat="{}" lon="{}"/>
+)",
+                       i + 2U, 48.0 + 0.001 * std::cos(i * 6.28 / n),
+                       9.0 + 0.001 * std::sin(i * 6.28 / n));
+  }
+  for (auto i = 0U; i != n; ++i) {
+    xml += fmt::format(R"(  <way id="{}">
+    <nd ref="1"/><nd ref="{}"/>
+    <tag k="highway" v="footway"/>
+  </way>
+)",
+                       i + 1U, i + 2U);
+  }
+  xml += "</osm>";
+
+  auto const osm = osr::test::write_osm_pbf("osr_too_many_ways", xml);
+  EXPECT_THROW(extract(false, osm, p, {}), std::exception);
 }
 
 TEST(extract, standalone_ramp) {
