@@ -47,6 +47,7 @@
 #include "osr/extract/osm_areas.h"
 #include "osr/extract/tag_parser.h"
 #include "osr/extract/tags.h"
+#include "osr/extract/walkable_areas.h"
 #include "osr/lookup.h"
 #include "osr/platforms.h"
 #include "osr/preprocessing/elevation/provider.h"
@@ -665,6 +666,18 @@ struct node_handler : public osmium::handler::Handler {
   hash_map<osm_node_idx_t, level_bits_t> const& elevator_nodes_;
 };
 
+struct walkable_area_way_handler : public osmium::handler::Handler {
+  explicit walkable_area_way_handler(walkable_area_collector& c) : c_{c} {}
+  void way(osmium::Way const& w) { c_.way(w); }
+  walkable_area_collector& c_;
+};
+
+struct walkable_area_blocker_handler : public osmium::handler::Handler {
+  explicit walkable_area_blocker_handler(walkable_area_collector& c) : c_{c} {}
+  void way(osmium::Way const& w) { c_.blocker_way(w); }
+  walkable_area_collector& c_;
+};
+
 struct rel_ways_handler : public osmium::handler::Handler {
   explicit rel_ways_handler(platforms* pl, rel_ways_t& rel_ways)
       : pl_{pl}, rel_ways_{rel_ways} {}
@@ -698,7 +711,8 @@ struct rel_ways_handler : public osmium::handler::Handler {
 void extract(bool const with_platforms,
              fs::path const& in,
              fs::path const& out,
-             fs::path const& elevation_dir) {
+             fs::path const& elevation_dir,
+             walkable_areas_hook const& on_walkable_areas) {
   auto ec = std::error_code{};
   fs::remove_all(out, ec);
   if (!fs::is_directory(out)) {
@@ -726,9 +740,13 @@ void extract(bool const with_platforms,
   }
   auto mp = osm::polygon_manager{/*assemble_way_polygons=*/false};
   auto areas = osm_areas{w};
+  auto walkable = on_walkable_areas
+                      ? std::make_unique<walkable_area_collector>(w)
+                      : nullptr;
 
-  // Timezone / low emission zone relations, stored (owned) in pass 1 for
-  // assembly after the ways pass collected the member way geometries.
+  // Timezone / low emission zone (and, with a walkable areas hook, walkable
+  // multipolygon) relations, stored (owned) in pass 1 for assembly after the
+  // ways pass collected the member way geometries.
   struct area_relation {
     std::int64_t id_;
     std::vector<std::tuple<std::int64_t, std::string, osm::member_type>>
@@ -737,11 +755,13 @@ void extract(bool const with_platforms,
   };
   auto area_relations = std::vector<area_relation>{};
 
-  auto const is_area_relation = [](osmium::TagList const& tags) {
+  auto const is_area_relation = [&](osmium::TagList const& tags) {
     auto const* boundary = tags["boundary"];
     return tags.has_key("timezone") ||
            (boundary != nullptr &&
-            std::string_view{boundary} == "low_emission_zone"sv);
+            std::string_view{boundary} == "low_emission_zone"sv) ||
+           (walkable != nullptr && tags.has_tag("type", "multipolygon") &&
+            is_walkable_area(tags, false));
   };
 
   auto const to_member_type = [](osmium::item_type const t) {
@@ -751,6 +771,10 @@ void extract(bool const with_platforms,
       default: return osm::member_type::kRelation;
     }
   };
+
+  // Highest ids in the file: virtual ways (walkable areas) follow them.
+  auto max_node_id = std::int64_t{0};
+  auto max_way_id = std::int64_t{0};
 
   w.node_way_counter_.reserve(14'000'000'000);
   {  // Pass 1: node index, blocking nodes, relations.
@@ -767,6 +791,7 @@ void extract(bool const with_platforms,
       osmium::memory::Buffer rels_{1U << 12U,
                                    osmium::memory::Buffer::auto_grow::yes};
       std::vector<area_relation> area_relations_;
+      std::int64_t max_node_id_{0};
     };
 
     osm::parse_osm_block_parallel_collect<pass1_ctx>(
@@ -774,6 +799,7 @@ void extract(bool const with_platforms,
         [&](pass1_ctx& ctx, std::int64_t const id, geo::latlng const& pos,
             auto&& tag_range) {
           ctx.enc_.node(osm::node{id, geo::fixed_latlng::from_latlng(pos)});
+          ctx.max_node_id_ = std::max(ctx.max_node_id_, id);
           if (std::ranges::begin(tag_range) != std::ranges::end(tag_range)) {
             auto const t = tags{osm_obj_type::kNode, tag_range};
             auto const accessible =
@@ -828,6 +854,7 @@ void extract(bool const with_platforms,
         [&](pass1_ctx& ctx) { ctx.nodes_ = std::move(ctx.enc_).finish(); },
         [&](std::size_t, pass1_ctx&& ctx) {
           node_idx_merger.merge(std::move(ctx.nodes_));
+          max_node_id = std::max(max_node_id, ctx.max_node_id_);
           for (auto const id : ctx.blocking_nodes_) {
             w.node_way_counter_.increment(id);
           }
@@ -847,6 +874,10 @@ void extract(bool const with_platforms,
     pt->status("Load OSM / Ways").in_high(blocks.size()).out_bounds(15, 38);
 
     auto h = way_handler{w, pl.get(), rel_ways, elevator_nodes};
+    auto walkable_h = std::optional<walkable_area_way_handler>{};
+    if (walkable != nullptr) {
+      walkable_h.emplace(*walkable);
+    }
 
     struct pass2_ctx {
       osmium::memory::Buffer scratch_{1U << 12U,
@@ -856,12 +887,14 @@ void extract(bool const with_platforms,
           decoded_tags_;
       osmium::memory::Buffer ways_{1U << 16U,
                                    osmium::memory::Buffer::auto_grow::yes};
+      std::int64_t max_way_id_{0};
     };
 
     osm::parse_osm_block_parallel_collect<pass2_ctx>(
         blocks, osm::skip{},
         [&](pass2_ctx& ctx, std::int64_t const id, auto&& refs,
             auto&& tag_range) {
+          ctx.max_way_id_ = std::max(ctx.max_way_id_, id);
           auto& ow = ctx.decoded_ways_.emplace_back();
           ow.id = id;
           for (auto const ref : refs) {
@@ -886,11 +919,18 @@ void extract(bool const with_platforms,
             }
           }
         },
-        [&](std::size_t, pass2_ctx&& ctx) { osmium::apply(ctx.ways_, h); },
+        [&](std::size_t, pass2_ctx&& ctx) {
+          max_way_id = std::max(max_way_id, ctx.max_way_id_);
+          if (walkable_h.has_value()) {
+            osmium::apply(ctx.ways_, h, *walkable_h);  // in this order
+          } else {
+            osmium::apply(ctx.ways_, h);
+          }
+        },
         pt->update_fn());
   }
 
-  {  // Assemble timezone and low emission zone polygons.
+  {  // Assemble timezone, low emission zone and walkable area polygons.
     pt->status("Load OSM / Areas")
         .in_high(std::max(std::size_t{1U}, area_relations.size()))
         .out_bounds(38, 39);
@@ -899,13 +939,74 @@ void extract(bool const with_platforms,
     for (auto const& ar : area_relations) {
       auto const pa = mp.assemble_area(ar.id_, ar.members_, ar.tags_);
       if (pa.valid) {
-        areas.add_area(osm::build_area(scratch, pa, ar.tags_));
+        auto const& area = osm::build_area(scratch, pa, ar.tags_);
+        areas.add_area(area);
+        if (walkable != nullptr) {
+          walkable->multipolygon(area);
+        }
       } else {
         std::clog << "osr: area assembly failed for relation " << ar.id_ << " ("
                   << ar.members_.size() << " members)\n";
       }
       pt->increment();
     }
+  }
+
+  if (walkable != nullptr) {  // Walkable areas: connectors and obstacles.
+    pt->status("Load OSM / Walkable Areas")
+        .in_high(blocks.size())
+        .out_bounds(39, 40);
+
+    walkable->find_connectors();
+
+    auto h = walkable_area_blocker_handler{*walkable};
+
+    struct blocker_ctx {
+      osmium::memory::Buffer scratch_{1U << 12U,
+                                      osmium::memory::Buffer::auto_grow::yes};
+      std::vector<osm::way> decoded_ways_;
+      std::vector<std::vector<std::pair<std::string_view, std::string_view>>>
+          decoded_tags_;
+      osmium::memory::Buffer ways_{1U << 16U,
+                                   osmium::memory::Buffer::auto_grow::yes};
+    };
+
+    osm::parse_osm_block_parallel_collect<blocker_ctx>(
+        blocks, osm::skip{},
+        [&](blocker_ctx& ctx, std::int64_t const id, auto&& refs,
+            auto&& tag_range) {
+          auto const [building, barrier] =
+              osm::read_tags(tag_range, "building", "barrier");
+          if (building.empty() && barrier.empty()) {
+            return;
+          }
+          auto& ow = ctx.decoded_ways_.emplace_back();
+          ow.id = id;
+          for (auto const ref : refs) {
+            ow.node_refs.emplace_back(osm::node_ref{ref, {}});
+          }
+          auto& t = ctx.decoded_tags_.emplace_back();
+          for (auto const& [k, v] : tag_range) {
+            t.emplace_back(k, v);
+          }
+        },
+        osm::skip{},
+        [&](blocker_ctx& ctx) {
+          osm::update_locations(node_idx, ctx.decoded_ways_);
+          for (auto const [ow, t] :
+               utl::zip(ctx.decoded_ways_, ctx.decoded_tags_)) {
+            ctx.ways_.add_item(osm::build_way(ctx.scratch_, ow, t));
+            ctx.ways_.commit();
+          }
+        },
+        [&](std::size_t, blocker_ctx&& ctx) { osmium::apply(ctx.ways_, h); },
+        pt->update_fn());
+  }
+
+  auto area_ways = std::optional<virtual_ways>{};
+  if (walkable != nullptr) {  // Virtual ways through the walkable areas.
+    area_ways.emplace(w, max_node_id, max_way_id);
+    on_walkable_areas(out, w, walkable->finish(), *area_ways);
   }
 
   {  // Set way properties that depend on the assembled areas.
@@ -1039,6 +1140,10 @@ void extract(bool const with_platforms,
   }
 
   w.add_restriction(r);
+
+  if (area_ways.has_value()) {
+    area_ways->set_node_properties();
+  }
 
   utl::sort(w.r_->multi_level_elevators_);
 
